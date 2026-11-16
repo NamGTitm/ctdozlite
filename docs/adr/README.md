@@ -39,5 +39,6 @@ What we will do, in one paragraph, present tense.
 | [0002](0002-self-updater.md) | Self-updater and `latest.json` contract | accepted |
 | [0003](0003-changelog-policy.md) | Changelog and release notes policy | accepted |
 | [0004](0004-local-api-authentication.md) | Local REST API authentication and CORS | proposed |
+| [0005](0005-local-api-session-lifecycle.md) | Local API session ownership and lifecycle | proposed |
 
 Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).

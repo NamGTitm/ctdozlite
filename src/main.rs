@@ -18,6 +18,41 @@ pub use zalo_rust::{
 
 pub const POLL_SECS: u64 = 4;
 
+fn resolve_api_port(
+    args: &[String],
+    env_port: std::result::Result<String, std::env::VarError>,
+) -> anyhow::Result<Option<u16>> {
+    let cli_port = args
+        .iter()
+        .position(|arg| arg == "--api-port")
+        .map(|index| {
+            args.get(index + 1)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("--api-port requires a port from 1 through 65535"))
+        })
+        .transpose()?;
+    let raw = match cli_port {
+        Some(value) => Some((value, "--api-port")),
+        None => match env_port {
+            Ok(value) => Some((value, "CTDOZLITE_API_PORT")),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("CTDOZLITE_API_PORT must be valid UTF-8")
+            }
+        },
+    };
+    let Some((raw, source)) = raw else {
+        return Ok(None);
+    };
+    let port = raw
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("{source} must be an integer from 1 through 65535"))?;
+    if port == 0 {
+        anyhow::bail!("{source} must be an integer from 1 through 65535");
+    }
+    Ok(Some(port))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -100,6 +135,9 @@ async fn main() -> Result<()> {
     let force_qr = args.iter().any(|a| a == "--qr");
     let force_logout = args.iter().any(|a| a == "--logout");
     let force_mcp = args.iter().any(|a| a == "--mcp");
+    let api_only = args.iter().any(|a| a == "--api-only");
+    let launch_gui =
+        force_gui || (!force_tui && !force_qr && !args.iter().any(|a| a.starts_with("--phone")));
     // --auth status|set <key>|clear : manage the LLM API key (own auth, never opencode's).
     if let Some(i) = args.iter().position(|a| a == "--auth") {
         let sub = args.get(i + 1).cloned().unwrap_or_else(|| "status".into());
@@ -168,16 +206,8 @@ async fn main() -> Result<()> {
         .unwrap_or(10);
     let tg_dry = args.iter().any(|a| a == "--dry-run");
     let tg_media = args.iter().any(|a| a == "--media");
-    let api_port: Option<u16> = args
-        .iter()
-        .position(|a| a == "--api-port")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse::<u16>().ok())
-        .or_else(|| {
-            std::env::var("CTDOZLITE_API_PORT")
-                .ok()
-                .and_then(|v| v.parse::<u16>().ok())
-        });
+    let api_port_setting = resolve_api_port(&args, std::env::var("CTDOZLITE_API_PORT"))
+        .map_err(|error| error.to_string());
     let cli_proxy: Option<String> = args
         .iter()
         .position(|a| a == "--proxy")
@@ -287,24 +317,34 @@ async fn main() -> Result<()> {
         return api_mcp::run_mcp_stdio_server_bound(shared, "zalo_history.db", thread_arg).await;
     }
 
-    // If `--api-port <PORT>` is set without `--gui`/`--tui`, run headless REST + MCP server if `--api-only` is passed;
-    // otherwise spawn the REST server in the background alongside GUI/TUI (#35).
-    if let Some(port) = api_port {
-        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(s.clone()));
-        println!("🌐 REST API & MCP HTTP server đang lắng nghe tại http://127.0.0.1:{port}/api/v1/status");
-        if args.iter().any(|a| a == "--api-only") {
-            return api_mcp::run_local_http_server(shared, port, "zalo_history.db".into()).await;
-        }
-        tokio::spawn(async move {
-            let _ = api_mcp::run_local_http_server(shared, port, "zalo_history.db".into()).await;
-        });
+    if api_only {
+        let port = api_port_setting
+            .clone()
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("--api-only requires --api-port or CTDOZLITE_API_PORT")
+            })?;
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(s));
+        let mut server = api_mcp::ApiServer::start(shared, port, "zalo_history.db".into()).await?;
+        println!(
+            "REST API & MCP HTTP server đang lắng nghe tại http://{}/api/v1/status",
+            server.local_addr()
+        );
+        return tokio::select! {
+            result = server.wait() => result,
+            signal = tokio::signal::ctrl_c() => {
+                let shutdown = server.shutdown().await;
+                signal?;
+                shutdown
+            }
+        };
     }
 
     // Determine launch mode:
     // If `--gui` is specified (or default when not `--tui` / `--qr` / `--phone`):
     // Open the native GUI window IMMEDIATELY without blocking on network requests!
     // Background worker in `gui.rs` handles `get_server_info`, `get_friends`, and `poll_new_messages`.
-    if force_gui || (!force_tui && !force_qr && !args.iter().any(|a| a.starts_with("--phone"))) {
+    if launch_gui {
         println!("🚀 Đang khởi chạy giao diện đồ họa ctdozlite (egui)…");
         #[cfg(target_os = "windows")]
         if dev_mode {
@@ -345,15 +385,19 @@ async fn main() -> Result<()> {
             "ctdozlite",
             native_options,
             Box::new(move |cc| {
-                Ok(Box::new(gui::ZaloGuiApp::new(
+                Ok(Box::new(gui::ZaloGuiApp::new_with_api(
                     cc,
                     app_session,
                     dev_mode,
                     initial_threads,
+                    api_port_setting.clone(),
                 )))
             }),
         )
         .map_err(|e| anyhow::anyhow!("Không thể khởi chạy GUI: {e}"));
+        if let Err(error) = gui::shutdown_session_worker().await {
+            eprintln!("! Không thể dừng worker GUI sạch sẽ: {error}");
+        }
         if res.is_ok() {
             std::process::exit(0);
         }
@@ -499,6 +543,17 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mut api_server = if let Some(port) = api_port_setting.clone().map_err(anyhow::Error::msg)? {
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(s.clone()));
+        let server = api_mcp::ApiServer::start(shared, port, "zalo_history.db".into()).await?;
+        println!(
+            "REST API & MCP HTTP server đang lắng nghe tại http://{}/api/v1/status",
+            server.local_addr()
+        );
+        Some(server)
+    } else {
+        None
+    };
     let mut tui_app = tui::TuiApp::new(&mut s, initial_threads);
     if let Some(ref want) = thread_arg {
         if tui_app.select_thread_by_id(want) {
@@ -507,7 +562,51 @@ async fn main() -> Result<()> {
             eprintln!("! Không tìm thấy hội thoại: {want}");
         }
     }
-    tui::run_tui(tui_app).await?;
+    let tui_result = tui::run_tui(tui_app).await;
+    if let Some(server) = api_server.take() {
+        server.shutdown().await?;
+    }
+    tui_result?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_port_prefers_cli_over_environment() {
+        let args = vec!["--api-port".into(), "17891".into()];
+        assert_eq!(
+            resolve_api_port(&args, Ok("17892".into())).unwrap(),
+            Some(17891)
+        );
+    }
+
+    #[test]
+    fn api_port_uses_environment_when_cli_is_absent() {
+        assert_eq!(
+            resolve_api_port(&[], Ok("17892".into())).unwrap(),
+            Some(17892)
+        );
+        assert_eq!(
+            resolve_api_port(&[], Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn api_port_rejects_invalid_cli_even_when_environment_is_valid() {
+        let args = vec!["--api-port".into(), "zero".into()];
+        assert!(resolve_api_port(&args, Ok("17892".into())).is_err());
+        assert!(
+            resolve_api_port(&["--api-port".into()], Err(std::env::VarError::NotPresent)).is_err()
+        );
+        assert!(resolve_api_port(
+            &["--api-port".into(), "0".into()],
+            Err(std::env::VarError::NotPresent)
+        )
+        .is_err());
+    }
 }

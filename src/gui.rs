@@ -1738,11 +1738,25 @@ fn thread_texts(threads: &[Thread]) -> impl Iterator<Item = &str> {
 }
 
 impl ZaloGuiApp {
+    /// Create the GUI without starting an optional REST API listener.
     pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        session: Session,
+        dev_mode: bool,
+        initial_threads: Vec<Thread>,
+    ) -> Self {
+        Self::new_with_api(cc, session, dev_mode, initial_threads, Ok(None))
+    }
+
+    /// Create the GUI and pass the resolved optional API port to its worker.
+    ///
+    /// An invalid port setting is retained for the worker to report through the GUI status event.
+    pub fn new_with_api(
         cc: &eframe::CreationContext<'_>,
         mut session: Session,
         dev_mode: bool,
         initial_threads: Vec<Thread>,
+        api_port: Result<Option<u16>, String>,
     ) -> Self {
         let mut loaded_settings = AppSettings::load();
         setup_custom_fonts_with_choice(&cc.egui_ctx, &loaded_settings.font_family);
@@ -2084,6 +2098,7 @@ impl ZaloGuiApp {
                 ctx: cc.egui_ctx.clone(),
             },
             cc.egui_ctx.clone(),
+            api_port,
         );
         ensure_cjk_font(&cc.egui_ctx, thread_texts(&app.threads));
 
@@ -2097,6 +2112,14 @@ impl ZaloGuiApp {
         }
         app
     }
+}
+
+/// Ask the GUI worker to stop and wait for its API listener to shut down.
+///
+/// # Errors
+/// Returns an error if the worker does not stop or its API server cannot shut down cleanly.
+pub async fn shutdown_session_worker() -> anyhow::Result<()> {
+    worker::shutdown_session_worker().await
 }
 
 /// Maximum retries after an initial sticker/image download failure (1 initial + 2 retries = 3 attempts).

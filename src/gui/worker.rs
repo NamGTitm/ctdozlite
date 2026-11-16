@@ -500,6 +500,9 @@ pub enum WorkerCmd {
         expected_sha256: Option<String>,
     },
     Logout,
+    Shutdown {
+        done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Delete local message data (`zalo_history.db` + `threads_cache.json`) without
     /// touching credentials. Separate from [`WorkerCmd::Logout`] by design (#21).
     WipeLocalData,
@@ -705,7 +708,12 @@ async fn prefetch_missing_sticker_thumbnails(
     futures_util::future::join_all(futs).await;
 }
 
-pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: egui::Context) {
+pub(super) fn spawn_session_worker(
+    session: Session,
+    gui_tx: GuiTx,
+    egui_ctx: egui::Context,
+    api_port: std::result::Result<Option<u16>, String>,
+) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
     let _ = WORKER_TX.set(cmd_tx);
 
@@ -727,6 +735,36 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                 .unwrap();
 
             rt.block_on(async move {
+                let mut api_server = match api_port {
+                    Ok(Some(port)) => match crate::api_mcp::ApiServer::start(
+                        session.clone(),
+                        port,
+                        "zalo_history.db".into(),
+                    )
+                    .await
+                    {
+                        Ok(server) => {
+                            let _ = gui_tx.send(GuiEvent::StatusUpdate(format!(
+                                "REST API đang lắng nghe tại http://{}/api/v1/status",
+                                server.local_addr()
+                            )));
+                            Some(server)
+                        }
+                        Err(error) => {
+                            let _ = gui_tx.send(GuiEvent::StatusUpdate(format!(
+                                "Không thể khởi động REST API: {error}"
+                            )));
+                            None
+                        }
+                    },
+                    Ok(None) => None,
+                    Err(error) => {
+                        let _ = gui_tx.send(GuiEvent::StatusUpdate(format!(
+                            "Cấu hình REST API không hợp lệ: {error}"
+                        )));
+                        None
+                    }
+                };
                 {
                     let s = session.lock().await.clone();
                     let _ = crate::login::get_server_info(&s).await;
@@ -747,22 +785,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     }
                 });
 
-                // Scheduled messages worker (#38) + optional HTTP REST API server (#35)
-                if let Ok(port_str) = std::env::var("CTDOZLITE_API_PORT") {
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        if port > 0 {
-                            let s_api = session.clone();
-                            tokio::spawn(async move {
-                                let _ = crate::api_mcp::run_local_http_server(
-                                    s_api,
-                                    port,
-                                    "zalo_history.db".into(),
-                                )
-                                .await;
-                            });
-                        }
-                    }
-                }
+                // Scheduled messages worker (#38).
                 {
                     let s_sched = session.clone();
                     let gui_tx_sched = gui_tx.clone();
@@ -1398,10 +1421,29 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     tokio::spawn(crate::background_accounts::supervise(session.clone(), sink));
                 }
 
+                let mut shutdown_reply = None;
                 let mut current_qr_task: Option<tokio::task::JoinHandle<()>> = None;
                 let mut current_password_task: Option<tokio::task::JoinHandle<()>> = None;
 
-                while let Some(cmd) = cmd_rx.recv().await {
+                loop {
+                    let cmd = if let Some(server) = api_server.as_mut() {
+                        tokio::select! {
+                            result = server.wait() => {
+                                let message = match result {
+                                    Ok(()) => "REST API đã dừng ngoài yêu cầu.".to_string(),
+                                    Err(error) => format!("REST API đã dừng do lỗi: {error}"),
+                                };
+                                let _ = gui_tx.send(GuiEvent::StatusUpdate(message));
+                                api_server.take();
+                                egui_ctx.request_repaint();
+                                continue;
+                            }
+                            cmd = cmd_rx.recv() => cmd,
+                        }
+                    } else {
+                        cmd_rx.recv().await
+                    };
+                    let Some(cmd) = cmd else { break };
                     match cmd {
                         WorkerCmd::ReadNotificationAuthorization { request_id }
                         | WorkerCmd::RequestNotificationAuthorization { request_id } => {
@@ -1470,6 +1512,10 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let _ = gui_tx.send(GuiEvent::LoggedOut);
                             egui_ctx.request_repaint();
                         }
+                        WorkerCmd::Shutdown { done } => {
+                            shutdown_reply = Some(done);
+                            break;
+                        }
                         WorkerCmd::SwitchAccount { target_uin } => {
                             // A login left pending by "add account" must not sign in
                             // after the user went back to an existing account.
@@ -1483,12 +1529,14 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 let s = session.lock().await;
                                 s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default()
                             };
+                            session.lock().await.begin_session_transition();
                             if let Err(e) = crate::account_manager::switch_to_account(&cur_uin, &target_uin) {
                                 let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("⚠️ Lỗi chuyển tài khoản: {e}")));
                                 egui_ctx.request_repaint();
                             } else {
                                 let mut s = session.lock().await;
-                                if s.load_from_file("session.json").is_ok() {
+                                match s.load_from_file("session.json") {
+                                    Ok(()) => {
                                     let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
                                     let name = s.login.as_ref().map(|l| l.display_name.clone()).unwrap_or_default();
                                     let ava = s.login.as_ref().and_then(|l| if l.avatar.is_empty() { None } else { Some(l.avatar.clone()) });
@@ -1510,6 +1558,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         avatar: ava,
                                         threads,
                                     });
+                                    }
+                                    Err(error) => {
+                                        s.logout();
+                                        crate::account_manager::set_active_uin("");
+                                        drop(s);
+                                        let _ = gui_tx.send(GuiEvent::LoggedOut);
+                                        let _ = gui_tx.send(GuiEvent::StatusUpdate(format!(
+                                            "Không thể nạp phiên tài khoản đã chọn: {error}"
+                                        )));
+                                    }
                                 }
                                 egui_ctx.request_repaint();
                             }
@@ -4736,9 +4794,35 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                     }
                 }
+                let shutdown_result = match api_server.take() {
+                    Some(server) => server.shutdown().await.map_err(|error| error.to_string()),
+                    None => Ok(()),
+                };
+                if let Some(done) = shutdown_reply {
+                    let _ = done.send(shutdown_result);
+                } else if let Err(error) = shutdown_result {
+                    let _ = gui_tx.send(GuiEvent::StatusUpdate(format!(
+                        "⚠️ Không thể dừng REST API sạch sẽ: {error}"
+                    )));
+                }
             });
         })
         .expect("Failed to spawn zalo-worker thread");
+}
+
+pub(super) async fn shutdown_session_worker() -> anyhow::Result<()> {
+    let Some(tx) = WORKER_TX.get() else {
+        return Ok(());
+    };
+    let (done, stopped) = tokio::sync::oneshot::channel();
+    if tx.send(WorkerCmd::Shutdown { done }).is_err() {
+        return Ok(());
+    }
+    let result = tokio::time::timeout(Duration::from_secs(5), stopped)
+        .await
+        .map_err(|_| anyhow::anyhow!("GUI worker shutdown timed out"))?
+        .map_err(|_| anyhow::anyhow!("GUI worker stopped without reporting API shutdown"))?;
+    result.map_err(anyhow::Error::msg)
 }
 
 const GITHUB_REPO: &str = "ctdoteam1110/ctdozlite";

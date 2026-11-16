@@ -3,6 +3,7 @@
 //! Mirrors the `_get` / `_post` / `_getCommonParams` / `getEncodedParams` helpers from
 //! `compact-app-pc-*.js`. See `re-notes/02_chat_data.md` §2–§4.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -548,6 +549,10 @@ pub struct Session {
     pub expired_at: Option<i64>,
     /// Optional outbound proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`) for multi-account setups (#64).
     pub proxy_url: Option<String>,
+    // Clones share the counter so account changes revoke snapshots already held by API requests.
+    generation: Arc<AtomicU64>,
+    generation_snapshot: u64,
+    api_accessible: bool,
 }
 
 /// Normalize and validate a proxy URL string (`http://`, `https://`, `socks5://`, `socks5h://`, or `host:port`, #64).
@@ -738,7 +743,43 @@ impl Session {
             dump_raw,
             expired_at: None,
             proxy_url: env_proxy,
+            generation: Arc::new(AtomicU64::new(0)),
+            generation_snapshot: 0,
+            api_accessible: false,
         })
+    }
+
+    fn advance_generation(&mut self) {
+        self.generation_snapshot = self
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+    }
+
+    fn has_credentials(&self) -> bool {
+        self.login.is_some()
+            && self
+                .zpw_sek
+                .as_deref()
+                .is_some_and(|sek| !sek.is_empty() && sek != "EXPIRED")
+            && self.expired_at.is_none()
+    }
+
+    pub(crate) fn is_api_session_authorized(&self) -> bool {
+        self.api_accessible && self.generation_is_current() && self.has_credentials()
+    }
+
+    pub(crate) fn session_generation(&self) -> u64 {
+        self.generation_snapshot
+    }
+
+    pub(crate) fn generation_is_current(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == self.generation_snapshot
+    }
+
+    pub(crate) fn begin_session_transition(&mut self) {
+        self.advance_generation();
+        self.api_accessible = false;
     }
 
     /// Configure or clear the HTTP/HTTPS/SOCKS5 proxy for this session, rebuilding the underlying
@@ -903,12 +944,16 @@ impl Session {
     /// marker but **keeps every credential**, so it can still be read if the verdict was
     /// wrong — and it is only replaced once a fresh login succeeds.
     pub fn mark_expired(&mut self) {
+        self.advance_generation();
+        self.api_accessible = false;
         self.expired_at = Some(crate::login::unix_now());
     }
 
     /// A fresh login succeeded: the marker must not leak into the new session.
     pub fn clear_expired(&mut self) {
+        self.advance_generation();
         self.expired_at = None;
+        self.api_accessible = self.has_credentials();
     }
 
     /// Ask the server whether the stored session still works.
@@ -1022,6 +1067,8 @@ impl Session {
 
     /// Clear all session credentials, tokens, keys, and cookies.
     pub fn logout(&mut self) {
+        self.advance_generation();
+        self.api_accessible = false;
         self.login = None;
         self.zpw_sek = None;
         self.secret_key = None;
@@ -1078,6 +1125,8 @@ impl Session {
         use base64::Engine;
         let text = std::fs::read_to_string(path)?;
         let saved: SavedSession = serde_json::from_str(&text)?;
+
+        self.begin_session_transition();
 
         if self.proxy_url.is_none() {
             if let Some(ref p) = saved.proxy_url {
@@ -1140,6 +1189,8 @@ impl Session {
             self.login = None;
             anyhow::bail!("session.json thiếu mã xác thực zpw_sek");
         }
+
+        self.api_accessible = self.has_credentials();
 
         Ok(())
     }
@@ -1352,6 +1403,7 @@ impl Session {
         mime_type: &str,
         file_bytes: &[u8],
     ) -> Result<Value> {
+        self.ensure_generation_current()?;
         let boundary = format!(
             "----WebKitFormBoundary{}",
             crate::param_cipher::random_hex(16)
@@ -1383,6 +1435,7 @@ impl Session {
                 .header("Origin", "https://chat.zalo.me")
                 .header("Referer", "https://chat.zalo.me/");
         }
+        self.ensure_generation_current()?;
         let resp = rb.body(body).send().await?;
         let latency_ms = start.elapsed().as_millis();
         let status = resp.status();
@@ -1412,6 +1465,7 @@ impl Session {
     }
 
     async fn send(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
+        self.ensure_generation_current()?;
         let start = std::time::Instant::now();
         if is_url_blocked_by_privacy(url) {
             let method = m.as_str().to_string();
@@ -1472,6 +1526,7 @@ impl Session {
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body(b.clone());
         }
+        self.ensure_generation_current()?;
         let resp_result = rb.send().await;
         let latency_ms = start.elapsed().as_millis();
 
@@ -1548,6 +1603,14 @@ impl Session {
             return Err(SessionError::new(code, msg).at(url).into());
         }
         Ok(v)
+    }
+
+    // shortcut: reqwest cannot recall dispatched requests; use cancellable transport if logout must abort them.
+    fn ensure_generation_current(&self) -> Result<()> {
+        if !self.generation_is_current() {
+            bail!("session changed before request dispatch");
+        }
+        Ok(())
     }
 
     /// `decryptResp` — when the request was param-encrypted, `data` comes back as
@@ -2209,5 +2272,45 @@ mod tests {
         .unwrap();
         assert!(info.phone.is_empty());
         assert!(!serde_json::to_string(&info).unwrap().contains("phone"));
+    }
+
+    #[tokio::test]
+    async fn session_transition_revokes_clones_and_blocks_stale_requests() {
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(LoginInfo {
+            uin: "account-a".into(),
+            zpw_sek: "test-sek-a".into(),
+            ..Default::default()
+        });
+        session.zpw_sek = Some("test-sek-a".into());
+        session.clear_expired();
+        let old = session.clone();
+
+        session.begin_session_transition();
+        assert!(!old.generation_is_current());
+        assert!(old.ensure_generation_current().is_err());
+        let error = old
+            .send(Method::GET, "http://127.0.0.1:1", None)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("session changed before request dispatch"));
+        assert!(!session.is_api_session_authorized());
+
+        session.login = Some(LoginInfo {
+            uin: "account-b".into(),
+            zpw_sek: "test-sek-b".into(),
+            ..Default::default()
+        });
+        session.zpw_sek = Some("test-sek-b".into());
+        session.clear_expired();
+        assert!(session.is_api_session_authorized());
+        assert!(!old.is_api_session_authorized());
+
+        let before_logout = session.clone();
+        session.logout();
+        assert!(!before_logout.generation_is_current());
+        assert!(!session.is_api_session_authorized());
     }
 }

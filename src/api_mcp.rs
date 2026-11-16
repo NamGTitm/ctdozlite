@@ -7,13 +7,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::chat;
 use crate::scheduler;
@@ -127,6 +128,19 @@ pub async fn handle_mcp_request_bound(
     }
     let req_id = id.unwrap_or(Value::Null);
 
+    let resource_session = if method == "resources/read" {
+        api_session_snapshot(session).await
+    } else {
+        None
+    };
+    if method == "resources/read" && resource_session.is_none() {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": { "code": -32001, "message": "session_unavailable: cần đăng nhập lại" }
+        }));
+    }
+
     match method {
         "initialize" => Some(json!({
             "jsonrpc": "2.0",
@@ -192,6 +206,16 @@ pub async fn handle_mcp_request_bound(
                 }
                 _ => json!({ "error": format!("Unknown resource URI: {uri}") }).to_string(),
             };
+            if resource_session
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.is_api_session_authorized())
+            {
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": { "code": -32001, "message": "session_unavailable: cần đăng nhập lại" }
+                }));
+            }
             Some(json!({
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -354,6 +378,48 @@ fn check_thread_bound(bound: &BoundThread, tool: &str, got: Option<&str>) -> Opt
     }
 }
 
+fn session_unavailable() -> Value {
+    json!({ "error": "session_unavailable", "message": "Phiên Zalo không khả dụng; hãy đăng nhập lại." })
+}
+
+async fn api_session_authorized(session: &Arc<Mutex<Session>>) -> bool {
+    api_session_snapshot(session).await.is_some()
+}
+
+async fn api_session_snapshot(session: &Arc<Mutex<Session>>) -> Option<Session> {
+    let snapshot = session.lock().await.clone();
+    snapshot.is_api_session_authorized().then_some(snapshot)
+}
+
+fn rest_tool_status(is_err: bool, payload: &Value) -> u16 {
+    if payload.get("error").and_then(Value::as_str) == Some("session_unavailable") {
+        401
+    } else if is_err {
+        400
+    } else {
+        200
+    }
+}
+
+async fn expire_api_session_if_rejected(
+    session: &Arc<Mutex<Session>>,
+    request_session: &Session,
+    err: &anyhow::Error,
+) -> bool {
+    if !request_session.generation_is_current() {
+        return true;
+    }
+    if crate::session::SessionStatus::from_error(err) != crate::session::SessionStatus::Expired {
+        return false;
+    }
+
+    let mut current = session.lock().await;
+    if current.session_generation() == request_session.session_generation() {
+        current.mark_expired();
+    }
+    true
+}
+
 async fn execute_tool_call(
     session: &Arc<Mutex<Session>>,
     name: &str,
@@ -361,16 +427,32 @@ async fn execute_tool_call(
     db_path: &str,
     bound: &BoundThread,
 ) -> (bool, Value) {
-    match name {
+    let request_session = api_session_snapshot(session).await;
+    if name != "zalo_status" && request_session.is_none() {
+        return (true, session_unavailable());
+    }
+
+    let mut response = match name {
         "zalo_status" => {
-            let s = session.lock().await;
-            let logged_in = s.login.is_some() && s.zpw_sek.is_some();
-            let uin = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or("");
-            let display_name = s
-                .login
-                .as_ref()
-                .map(|l| l.display_name.as_str())
-                .unwrap_or("");
+            let logged_in = request_session.is_some();
+            let uin = if logged_in {
+                request_session
+                    .as_ref()
+                    .and_then(|s| s.login.as_ref())
+                    .map(|l| l.uin.as_str())
+                    .unwrap_or("")
+            } else {
+                ""
+            };
+            let display_name = if logged_in {
+                request_session
+                    .as_ref()
+                    .and_then(|s| s.login.as_ref())
+                    .map(|l| l.display_name.as_str())
+                    .unwrap_or("")
+            } else {
+                ""
+            };
             let thread_count = MessageStore::open(db_path)
                 .and_then(|st| st.all_threads())
                 .map(|v| v.len())
@@ -464,14 +546,19 @@ async fn execute_tool_call(
                 return (true, json!({ "error": "Missing required argument: text" }));
             };
             let is_group = args.get("is_group").and_then(Value::as_bool).unwrap_or(false);
-            let s = session.lock().await.clone();
+            let Some(s) = request_session.as_ref() else {
+                return (true, session_unavailable());
+            };
             let res = if is_group {
-                chat::send_group_message(&s, to_id, text).await
+                chat::send_group_message(s, to_id, text).await
             } else {
-                chat::send_message(&s, to_id, text).await
+                chat::send_message(s, to_id, text).await
             };
             match res {
                 Ok(resp) => (false, json!({ "ok": true, "to_id": to_id, "response": resp })),
+                Err(e) if expire_api_session_if_rejected(session, s, &e).await => {
+                    (true, session_unavailable())
+                }
                 Err(e) => (true, json!({ "error": e.to_string() })),
             }
         }
@@ -604,7 +691,20 @@ async fn execute_tool_call(
             }
         }
         _ => (true, json!({ "error": format!("Unknown tool: {name}") })),
+    };
+    if request_session
+        .as_ref()
+        .is_some_and(|snapshot| !snapshot.is_api_session_authorized())
+    {
+        if name == "zalo_status" {
+            response.1["logged_in"] = json!(false);
+            response.1["uin"] = json!("");
+            response.1["display_name"] = json!("");
+            return response;
+        }
+        return (true, session_unavailable());
     }
+    response
 }
 
 /// Run the MCP JSON-RPC 2.0 server over `stdin`/`stdout` (`ctdozlite --mcp`).
@@ -660,9 +760,45 @@ pub async fn handle_rest_request(
     body: &str,
     db_path: &str,
 ) -> (u16, Value) {
+    let path = path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(path, _)| path);
+    let status_request = method == "GET" && matches!(path, "/api/v1/status" | "/health");
+    let mcp_request = method == "POST" && path == "/api/v1/mcp";
+    let request_session = if status_request || mcp_request {
+        None
+    } else {
+        api_session_snapshot(session).await
+    };
+    if !status_request && !mcp_request && request_session.is_none() {
+        return (401, session_unavailable());
+    }
+
+    let response = handle_rest_request_inner(session, method, path_and_query, body, db_path).await;
+    if request_session
+        .as_ref()
+        .is_some_and(|snapshot| !snapshot.is_api_session_authorized())
+    {
+        return (401, session_unavailable());
+    }
+    response
+}
+
+async fn handle_rest_request_inner(
+    session: &Arc<Mutex<Session>>,
+    method: &str,
+    path_and_query: &str,
+    body: &str,
+    db_path: &str,
+) -> (u16, Value) {
     let (path, query_str) = path_and_query
         .split_once('?')
         .unwrap_or((path_and_query, ""));
+    let status_request = method == "GET" && matches!(path, "/api/v1/status" | "/health");
+    let mcp_request = method == "POST" && path == "/api/v1/mcp";
+    if !status_request && !mcp_request && !api_session_authorized(session).await {
+        return (401, session_unavailable());
+    }
     let query_params: HashMap<String, String> = query_str
         .split('&')
         .filter(|s| !s.is_empty())
@@ -674,7 +810,8 @@ pub async fn handle_rest_request(
 
     match (method, path) {
         ("GET", "/api/v1/status") | ("GET", "/health") => {
-            let (_, val) = execute_tool_call(session, "zalo_status", &json!({}), db_path, &None).await;
+            let (_, val) =
+                execute_tool_call(session, "zalo_status", &json!({}), db_path, &None).await;
             (200, val)
         }
         ("GET", "/api/v1/threads") => {
@@ -690,7 +827,7 @@ pub async fn handle_rest_request(
                 &None,
             )
             .await;
-            (200, val)
+            (rest_tool_status(false, &val), val)
         }
         ("GET", p) if p.starts_with("/api/v1/threads/") && p.ends_with("/messages") => {
             let tid = p
@@ -709,7 +846,7 @@ pub async fn handle_rest_request(
                 &None,
             )
             .await;
-            (if err { 400 } else { 200 }, val)
+            (rest_tool_status(err, &val), val)
         }
         ("GET", "/api/v1/search") => {
             let q = query_params.get("q").cloned().unwrap_or_default();
@@ -725,13 +862,13 @@ pub async fn handle_rest_request(
                 &None,
             )
             .await;
-            (if err { 400 } else { 200 }, val)
+            (rest_tool_status(err, &val), val)
         }
         ("POST", "/api/v1/messages/send") => {
             let payload: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
             let (err, val) =
                 execute_tool_call(session, "zalo_send_message", &payload, db_path, &None).await;
-            (if err { 400 } else { 200 }, val)
+            (rest_tool_status(err, &val), val)
         }
         ("POST", "/api/v1/messages/schedule") => {
             let payload: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
@@ -741,9 +878,15 @@ pub async fn handle_rest_request(
                     normalized["when"] = json!(ts.to_string());
                 }
             }
-            let (err, val) =
-                execute_tool_call(session, "zalo_schedule_message", &normalized, db_path, &None).await;
-            (if err { 400 } else { 200 }, val)
+            let (err, val) = execute_tool_call(
+                session,
+                "zalo_schedule_message",
+                &normalized,
+                db_path,
+                &None,
+            )
+            .await;
+            (rest_tool_status(err, &val), val)
         }
         ("GET", "/api/v1/scheduled") => {
             let tid = query_params.get("thread_id").map(String::as_str);
@@ -775,9 +918,15 @@ pub async fn handle_rest_request(
                     Err(e) => (500, json!({ "ok": false, "error": e.to_string() })),
                 }
             } else {
-                let (err, val) =
-                    execute_tool_call(session, "zalo_configure_autoreply", &payload, db_path, &None).await;
-                (if err { 400 } else { 200 }, val)
+                let (err, val) = execute_tool_call(
+                    session,
+                    "zalo_configure_autoreply",
+                    &payload,
+                    db_path,
+                    &None,
+                )
+                .await;
+                (rest_tool_status(err, &val), val)
             }
         }
         ("GET", "/api/v1/export") => {
@@ -1098,19 +1247,127 @@ async fn serve_local_http(
     session: Arc<Mutex<Session>>,
     db_path: String,
     config: ApiHttpConfig,
+    mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
+    let mut connections = JoinSet::new();
     loop {
-        let (stream, _) = listener.accept().await?;
-        tokio::spawn(handle_http_connection(
-            stream,
-            session.clone(),
-            db_path.clone(),
-            config.clone(),
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.context("REST API listener failed while accepting a connection")?;
+                connections.spawn(handle_http_connection(
+                    stream,
+                    session.clone(),
+                    db_path.clone(),
+                    config.clone(),
+                ));
+            }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    anyhow::bail!("REST API connection task failed: {error}");
+                }
+            }
+        }
+    }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    Ok(())
+}
+
+/// A bound local API listener owned by its caller.
+pub struct ApiServer {
+    local_addr: std::net::SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<Result<()>>>,
+}
+
+impl ApiServer {
+    /// Bind and start one authenticated local REST and MCP HTTP server.
+    ///
+    /// # Errors
+    /// Returns an error for invalid API authentication configuration, a failed local bind, or
+    /// a server task that cannot be started.
+    pub async fn start(session: Arc<Mutex<Session>>, port: u16, db_path: String) -> Result<Self> {
+        let config = ApiHttpConfig::from_env(port).context("invalid REST API configuration")?;
+        Self::start_with_config(session, db_path, config).await
+    }
+
+    async fn start_with_config(
+        session: Arc<Mutex<Session>>,
+        db_path: String,
+        mut config: ApiHttpConfig,
+    ) -> Result<Self> {
+        let bind_addr = format!("127.0.0.1:{}", config.port);
+        let listener = TcpListener::bind(&bind_addr)
+            .await
+            .with_context(|| format!("cannot bind REST API at {bind_addr}; check the address and whether the port is in use"))?;
+        let local_addr = listener
+            .local_addr()
+            .context("cannot read REST API listener address")?;
+        config.port = local_addr.port();
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(serve_local_http(
+            listener,
+            session,
+            db_path,
+            config,
+            shutdown_rx,
         ));
+        Ok(Self {
+            local_addr,
+            shutdown: Some(shutdown),
+            task: Some(task),
+        })
+    }
+
+    /// Return the loopback address held by this server.
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.local_addr
+    }
+
+    /// Wait until the listener exits or reports an error.
+    ///
+    /// # Errors
+    /// Returns an error if the listener or one of its connection tasks fails.
+    pub async fn wait(&mut self) -> Result<()> {
+        let joined = self
+            .task
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("REST API server task has already completed"))?
+            .await;
+        self.task.take();
+        joined.context("REST API server task failed")?
+    }
+
+    /// Stop the listener, abort open connections, and join the server task.
+    ///
+    /// # Errors
+    /// Returns an error if server shutdown fails.
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.signal_shutdown();
+        if self.task.is_some() {
+            self.wait().await?;
+        }
+        Ok(())
+    }
+
+    fn signal_shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
     }
 }
 
-/// Spawn the local HTTP REST & MCP server on `127.0.0.1:<port>`.
+impl Drop for ApiServer {
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+/// Run the local HTTP REST & MCP server on `127.0.0.1:<port>` until it exits.
 ///
 /// # Errors
 /// Returns an error if the required API token or origin configuration is invalid, the local port
@@ -1120,9 +1377,8 @@ pub async fn run_local_http_server(
     port: u16,
     db_path: String,
 ) -> Result<()> {
-    let config = ApiHttpConfig::from_env(port)?;
-    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
-    serve_local_http(listener, session, db_path, config).await
+    let mut server = ApiServer::start(session, port, db_path).await?;
+    server.wait().await
 }
 
 fn url_decode(s: &str) -> String {
@@ -1157,17 +1413,35 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    async fn start_test_server(
-        origins: &str,
-    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let config = ApiHttpConfig::new(address.port(), "test-api-token", origins).unwrap();
-        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
-        let task = tokio::spawn(async move {
-            let _ = serve_local_http(listener, session, ":memory:".into(), config).await;
+    async fn start_test_server(origins: &str) -> ApiServer {
+        let config = ApiHttpConfig::new(0, "test-api-token", origins).unwrap();
+        let session = Arc::new(Mutex::new(test_session("test-account")));
+        ApiServer::start_with_config(session, ":memory:".into(), config)
+            .await
+            .unwrap()
+    }
+
+    fn test_session(uin: &str) -> Session {
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: uin.into(),
+            zpw_sek: format!("test-sek-{uin}"),
+            ..Default::default()
         });
-        (address, task)
+        session.zpw_sek = Some(format!("test-sek-{uin}"));
+        session.clear_expired();
+        session
+    }
+
+    fn switch_test_session(session: &mut Session, uin: &str) {
+        session.begin_session_transition();
+        session.login = Some(crate::session::LoginInfo {
+            uin: uin.into(),
+            zpw_sek: format!("test-sek-{uin}"),
+            ..Default::default()
+        });
+        session.zpw_sek = Some(format!("test-sek-{uin}"));
+        session.clear_expired();
     }
 
     async fn send_http_request(
@@ -1176,9 +1450,19 @@ mod tests {
         host: &str,
         headers: &str,
     ) -> String {
+        send_http_path(address, method, "/api/v1/search?q=test", host, headers).await
+    }
+
+    async fn send_http_path(
+        address: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        host: &str,
+        headers: &str,
+    ) -> String {
         let mut stream = TcpStream::connect(address).await.unwrap();
         let request = format!(
-            "{method} /api/v1/search?q=test HTTP/1.1\r\nHost: {host}\r\n{headers}Connection: close\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{headers}Connection: close\r\n\r\n"
         );
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
@@ -1199,7 +1483,8 @@ mod tests {
 
     #[tokio::test]
     async fn http_api_rejects_missing_and_invalid_tokens() {
-        let (address, task) = start_test_server("").await;
+        let server = start_test_server("").await;
+        let address = server.local_addr();
         let host = local_host(address);
 
         let missing = send_http_request(address, "GET", &host, "").await;
@@ -1217,12 +1502,13 @@ mod tests {
         assert!(invalid.contains("Unauthorized"));
         assert!(!invalid.contains("wrong-token"));
 
-        task.abort();
+        server.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn http_api_echoes_only_configured_origins() {
-        let (address, task) = start_test_server("http://localhost:3000").await;
+        let server = start_test_server("http://localhost:3000").await;
+        let address = server.local_addr();
         let host = local_host(address);
 
         let trusted = send_http_request(
@@ -1246,12 +1532,13 @@ mod tests {
         assert!(untrusted.starts_with("HTTP/1.1 403 Forbidden"));
         assert!(!untrusted.contains("Access-Control-Allow-Origin:"));
 
-        task.abort();
+        server.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn http_api_allows_authenticated_non_browser_clients() {
-        let (address, task) = start_test_server("").await;
+        let server = start_test_server("").await;
+        let address = server.local_addr();
         let response = send_http_request(
             address,
             "GET",
@@ -1263,12 +1550,13 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(!response.contains("Access-Control-Allow-Origin:"));
 
-        task.abort();
+        server.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn preflight_does_not_authorize_the_follow_up_request() {
-        let (address, task) = start_test_server("http://localhost:3000").await;
+        let server = start_test_server("http://localhost:3000").await;
+        let address = server.local_addr();
         let host = local_host(address);
         let preflight = send_http_request(
             address,
@@ -1286,12 +1574,13 @@ mod tests {
             send_http_request(address, "POST", &host, "Origin: http://localhost:3000\r\n").await;
         assert!(follow_up.starts_with("HTTP/1.1 401 Unauthorized"));
 
-        task.abort();
+        server.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn http_api_rejects_untrusted_host_headers() {
-        let (address, task) = start_test_server("").await;
+        let server = start_test_server("").await;
+        let address = server.local_addr();
         let response = send_http_request(
             address,
             "GET",
@@ -1301,7 +1590,217 @@ mod tests {
         .await;
 
         assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
-        task.abort();
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_server_bind_failure_is_reported_without_replacing_the_existing_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = ApiHttpConfig::new(address.port(), "test-api-token", "").unwrap();
+        let session = Arc::new(Mutex::new(test_session("test-account")));
+        let result = ApiServer::start_with_config(session, ":memory:".into(), config).await;
+
+        let error = match result {
+            Ok(server) => {
+                server.shutdown().await.unwrap();
+                panic!("a second listener unexpectedly bound to the occupied port");
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(&address.port().to_string()));
+        assert!(TcpStream::connect(address).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn api_server_shutdown_releases_the_listener_and_rejects_duplicate_start() {
+        let first = start_test_server("").await;
+        let address = first.local_addr();
+        let config = ApiHttpConfig::new(address.port(), "test-api-token", "").unwrap();
+        let session = Arc::new(Mutex::new(test_session("test-account")));
+        let second = ApiServer::start_with_config(session, ":memory:".into(), config).await;
+        assert!(second.is_err());
+
+        first.shutdown().await.unwrap();
+        assert!(TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn http_api_rejects_authenticated_requests_without_a_session() {
+        let config = ApiHttpConfig::new(0, "test-api-token", "").unwrap();
+        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        let server = ApiServer::start_with_config(session, ":memory:".into(), config)
+            .await
+            .unwrap();
+        let address = server.local_addr();
+        let response = send_http_request(
+            address,
+            "GET",
+            &local_host(address),
+            "Authorization: Bearer test-api-token\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(response.contains("session_unavailable"));
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn running_api_tracks_account_switch_and_logout_without_listener_restart() {
+        let session = Arc::new(Mutex::new(test_session("account-a")));
+        let config = ApiHttpConfig::new(0, "test-api-token", "").unwrap();
+        let server = ApiServer::start_with_config(session.clone(), ":memory:".into(), config)
+            .await
+            .unwrap();
+        let address = server.local_addr();
+        let host = local_host(address);
+        let headers = "Authorization: Bearer test-api-token\r\n";
+
+        let account_a = send_http_path(address, "GET", "/api/v1/status", &host, headers).await;
+        assert!(account_a.contains("\"uin\":\"account-a\""));
+
+        switch_test_session(&mut *session.lock().await, "account-b");
+        let account_b = send_http_path(address, "GET", "/api/v1/status", &host, headers).await;
+        assert!(account_b.contains("\"uin\":\"account-b\""));
+
+        session.lock().await.logout();
+        let denied = send_http_path(address, "GET", "/api/v1/threads", &host, headers).await;
+        assert!(denied.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(denied.contains("session_unavailable"));
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_session_uses_the_replacement_account_and_revokes_old_snapshots() {
+        let shared = Arc::new(Mutex::new(test_session("account-a")));
+        let account_a = api_session_snapshot(&shared).await.unwrap();
+        assert_eq!(account_a.login.as_ref().unwrap().uin, "account-a");
+
+        switch_test_session(&mut *shared.lock().await, "account-b");
+        let account_b = api_session_snapshot(&shared).await.unwrap();
+
+        assert_eq!(account_b.login.as_ref().unwrap().uin, "account-b");
+        assert!(!account_a.is_api_session_authorized());
+        assert!(account_b.is_api_session_authorized());
+    }
+
+    #[tokio::test]
+    async fn failed_account_transition_keeps_api_access_revoked() {
+        let shared = Arc::new(Mutex::new(test_session("account-a")));
+        let old = api_session_snapshot(&shared).await.unwrap();
+        shared.lock().await.begin_session_transition();
+
+        assert!(!old.is_api_session_authorized());
+        assert!(api_session_snapshot(&shared).await.is_none());
+        let (status, body) =
+            handle_rest_request(&shared, "GET", "/api/v1/threads", "", ":memory:").await;
+        assert_eq!(status, 401);
+        assert_eq!(body["error"], "session_unavailable");
+    }
+
+    #[tokio::test]
+    async fn api_logout_revokes_the_old_session_and_returns_unauthorized() {
+        let shared = Arc::new(Mutex::new(test_session("account-a")));
+        let old = api_session_snapshot(&shared).await.unwrap();
+        shared.lock().await.logout();
+
+        assert!(api_session_snapshot(&shared).await.is_none());
+        assert!(!old.is_api_session_authorized());
+        let (status, body) = handle_rest_request(
+            &shared,
+            "POST",
+            "/api/v1/messages/send",
+            r#"{"to_id":"123","text":"test"}"#,
+            ":memory:",
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert_eq!(body["error"], "session_unavailable");
+
+        let (status, body) =
+            handle_rest_request(&shared, "GET", "/api/v1/status", "", ":memory:").await;
+        assert_eq!(status, 200);
+        assert_eq!(body["logged_in"], false);
+        assert_eq!(body["uin"], "");
+    }
+
+    #[tokio::test]
+    async fn concurrent_api_snapshot_is_revoked_before_dispatch_after_switch() {
+        let shared = Arc::new(Mutex::new(test_session("account-a")));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let request_session = shared.clone();
+        let request_barrier = barrier.clone();
+        let request = tokio::spawn(async move {
+            let snapshot = api_session_snapshot(&request_session).await.unwrap();
+            request_barrier.wait().await;
+            request_barrier.wait().await;
+            snapshot.is_api_session_authorized()
+        });
+
+        barrier.wait().await;
+        switch_test_session(&mut *shared.lock().await, "account-b");
+        barrier.wait().await;
+        let still_authorized = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!still_authorized);
+        assert_eq!(
+            api_session_snapshot(&shared)
+                .await
+                .unwrap()
+                .login
+                .unwrap()
+                .uin,
+            "account-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_api_request_does_not_revoke_a_replacement_account() {
+        let shared = Arc::new(Mutex::new(test_session("account-a")));
+        let old = api_session_snapshot(&shared).await.unwrap();
+        switch_test_session(&mut *shared.lock().await, "account-b");
+        let rejected: anyhow::Error = crate::session::SessionError::new(600, "expired").into();
+
+        assert!(expire_api_session_if_rejected(&shared, &old, &rejected).await);
+        let current = api_session_snapshot(&shared).await.unwrap();
+        assert_eq!(current.login.as_ref().unwrap().uin, "account-b");
+    }
+
+    #[tokio::test]
+    async fn expired_active_session_is_revoked_and_api_returns_unauthorized() {
+        let shared = Arc::new(Mutex::new(test_session("account-a")));
+        let active = api_session_snapshot(&shared).await.unwrap();
+        let rejected: anyhow::Error = crate::session::SessionError::new(600, "expired").into();
+
+        assert!(expire_api_session_if_rejected(&shared, &active, &rejected).await);
+        assert!(api_session_snapshot(&shared).await.is_none());
+        let (status, body) =
+            handle_rest_request(&shared, "GET", "/api/v1/threads", "", ":memory:").await;
+        assert_eq!(status, 401);
+        assert_eq!(body["error"], "session_unavailable");
+    }
+
+    #[tokio::test]
+    async fn mcp_data_requests_require_a_live_session() {
+        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        let response = handle_mcp_request(
+            &session,
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": { "uri": "zalo://threads" } }),
+            ":memory:",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["error"]["code"], -32001);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("session_unavailable"));
     }
 
     #[test]
@@ -1374,7 +1873,7 @@ mod tests {
                 .unwrap();
         }
 
-        let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
+        let session = Arc::new(Mutex::new(test_session("account-a")));
 
         // 1. MCP initialize
         let init_resp = handle_mcp_request(
