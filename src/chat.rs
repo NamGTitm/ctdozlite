@@ -6388,6 +6388,13 @@ pub fn resolve_attachment_file_name(title: Option<&str>, text: &str, url: &str) 
     }
 }
 
+pub(crate) fn is_video_file_extension(ext: &str) -> bool {
+    matches!(
+        ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str(),
+        "mp4" | "mov" | "mkv" | "webm" | "avi"
+    )
+}
+
 /// Extract rich link/media card metadata (`link_url`, `link_title`, `link_desc`, `link_thumb`, `link_src`)
 /// from a Zalo `chat.recommended` (`recommened.link`) or rich-object `content`.
 fn extract_link_info(
@@ -6468,12 +6475,7 @@ fn extract_link_info(
                 || url.to_ascii_lowercase().contains("video-")
                 || url.to_ascii_lowercase().contains(".dlmd.me")
                 || url.to_ascii_lowercase().contains("/video/")
-                || file_ext.as_deref().is_some_and(|e| {
-                    matches!(
-                        e.to_ascii_lowercase().as_str(),
-                        "mp4" | "mov" | "mkv" | "webm" | "avi"
-                    )
-                });
+                || file_ext.as_deref().is_some_and(is_video_file_extension);
 
             if let Some(params_str) = o.get("params").and_then(Value::as_str) {
                 if let Ok(p_json) = serde_json::from_str::<Value>(params_str.trim()) {
@@ -6511,16 +6513,19 @@ fn extract_link_info(
                         .map(str::to_string);
                 }
             }
-            let audio_ext = file_ext
+            let title_ext = title
                 .as_deref()
-                .or_else(|| title.as_deref()?.rsplit_once('.').map(|(_, ext)| ext));
-            let is_audio_file = audio_ext.is_some_and(|ext| {
-                matches!(
-                    ext.to_ascii_lowercase().as_str(),
-                    "mp3" | "m4a" | "wav" | "ogg" | "flac" | "aac" | "amr" | "awb" | "opus"
-                )
-            });
-            is_video |= has_duration && !is_audio_file;
+                .filter(|name| !name.starts_with("http://") && !name.starts_with("https://"))
+                .and_then(|name| name.rsplit_once('.'))
+                .filter(|(base, ext)| !base.is_empty() && !ext.is_empty())
+                .map(|(_, ext)| ext);
+            let has_file_extension = file_ext.is_some() || title_ext.is_some();
+            is_video |= file_ext.as_deref().is_some_and(is_video_file_extension)
+                || title_ext.is_some_and(is_video_file_extension);
+            is_video |= has_duration && !has_file_extension;
+            if title.is_none() && file_ext.is_some() {
+                title = Some(resolve_attachment_file_name(None, "", &url));
+            }
             if let (Some(ref mut t), Some(ref ext)) = (&mut title, &file_ext) {
                 let suffix = format!(".{ext}");
                 if !t
@@ -10902,6 +10907,98 @@ mod send_identity_tests {
         let msg_b = parse_chat_message(&raw_file_no_ext).expect("must parse file message");
         assert_eq!(msg_b.link_src.as_deref(), Some("Tập tin Zalo"));
         assert_eq!(msg_b.link_title.as_deref(), Some("De_cuong_mon_hoc.doc"));
+    }
+
+    #[test]
+    fn parse_share_file_preserves_file_ext_for_opaque_mp3_url() {
+        let raw_file = json!({
+            "msgId": "file_mp3_opaque",
+            "msgType": "share.file",
+            "uidFrom": "1000002",
+            "ts": 1700000003000_i64,
+            "content": {
+                "href": "https://files.example/download/opaque-token",
+                "params": "{\"fileSize\":\"12345\",\"fileExt\":\"mp3\",\"duration\":\"120\"}"
+            }
+        });
+
+        let msg = parse_chat_message(&raw_file).expect("must parse MP3 file message");
+        assert_eq!(msg.kind, crate::message_model::MessageKind::File);
+        assert_eq!(msg.link_src.as_deref(), Some("Tập tin Zalo"));
+        assert_eq!(msg.link_title.as_deref(), Some("opaque-token.mp3"));
+        assert_eq!(msg.text, "[Tập tin] opaque-token.mp3");
+    }
+
+    #[test]
+    fn parse_share_file_with_mp3_filename_and_duration_stays_a_file() {
+        let raw_file = json!({
+            "msgId": "file_mp3_named",
+            "msgType": "share.file",
+            "uidFrom": "1000002",
+            "ts": 1700000004000_i64,
+            "content": {
+                "title": "meeting.mp3",
+                "href": "https://files.example/download/opaque-token",
+                "params": "{\"duration\":\"120\"}"
+            }
+        });
+
+        let msg = parse_chat_message(&raw_file).expect("must parse named MP3 message");
+        assert_eq!(msg.kind, crate::message_model::MessageKind::File);
+        assert_eq!(msg.link_src.as_deref(), Some("Tập tin Zalo"));
+        assert_eq!(msg.link_title.as_deref(), Some("meeting.mp3"));
+    }
+
+    #[test]
+    fn parse_regular_file_with_duration_stays_a_file() {
+        let raw_file = json!({
+            "msgId": "file_pdf_duration",
+            "msgType": "share.file",
+            "uidFrom": "1000002",
+            "ts": 1700000004500_i64,
+            "content": {
+                "title": "report.pdf",
+                "href": "https://files.example/download/opaque-token",
+                "params": "{\"duration\":\"120\"}"
+            }
+        });
+
+        let msg = parse_chat_message(&raw_file).expect("must parse PDF message");
+        assert_eq!(msg.kind, crate::message_model::MessageKind::File);
+        assert_eq!(msg.link_src.as_deref(), Some("Tập tin Zalo"));
+    }
+
+    #[test]
+    fn parse_video_with_duration_and_opaque_url_stays_a_video() {
+        let raw_video = json!({
+            "msgId": "video_opaque_duration",
+            "msgType": "chat.recommended",
+            "uidFrom": "1000002",
+            "ts": 1700000005000_i64,
+            "content": {
+                "href": "https://media.example/download/opaque-token",
+                "params": "{\"duration\":\"45\"}"
+            }
+        });
+
+        let msg = parse_chat_message(&raw_video).expect("must parse video message");
+        assert_eq!(msg.kind, crate::message_model::MessageKind::Video);
+        assert_eq!(msg.link_src.as_deref(), Some("Video Zalo"));
+        assert_eq!(msg.text, "[Video]");
+
+        let named_video = json!({
+            "msgId": "video_named_duration",
+            "msgType": "chat.recommended",
+            "uidFrom": "1000002",
+            "ts": 1700000006000_i64,
+            "content": {
+                "title": "clip.mp4",
+                "href": "https://media.example/download/opaque-token",
+                "params": "{\"duration\":\"45\"}"
+            }
+        });
+        let named_msg = parse_chat_message(&named_video).expect("must parse named video message");
+        assert_eq!(named_msg.kind, crate::message_model::MessageKind::Video);
     }
 
     #[test]
