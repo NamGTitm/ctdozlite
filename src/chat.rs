@@ -6460,9 +6460,9 @@ fn extract_link_info(
                 .filter(|s| !s.is_empty());
             let mut has_file_params =
                 o.get("fileName").is_some() || url.to_ascii_lowercase().contains("/renewmedia");
+            let mut has_duration = o.get("duration").is_some();
 
             let mut is_video = o.get("videoUrl").is_some()
-                || o.get("duration").is_some()
                 || o.get("video_width").is_some()
                 || o.get("video_height").is_some()
                 || url.to_ascii_lowercase().contains("video-")
@@ -6493,12 +6493,10 @@ fn extract_link_info(
                             .map(|s| s.trim().trim_start_matches('.').to_string())
                             .filter(|s| !s.is_empty());
                     }
-                    if p_json.get("video_width").is_some()
-                        || p_json.get("video_height").is_some()
-                        || p_json.get("duration").is_some()
-                    {
+                    if p_json.get("video_width").is_some() || p_json.get("video_height").is_some() {
                         is_video = true;
                     }
+                    has_duration |= p_json.get("duration").is_some();
                     if p_json.get("fileExt").is_some()
                         || p_json.get("fileSize").is_some()
                         || p_json.get("checksum").is_some()
@@ -6513,6 +6511,16 @@ fn extract_link_info(
                         .map(str::to_string);
                 }
             }
+            let audio_ext = file_ext
+                .as_deref()
+                .or_else(|| title.as_deref()?.rsplit_once('.').map(|(_, ext)| ext));
+            let is_audio_file = audio_ext.is_some_and(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "mp3" | "m4a" | "wav" | "ogg" | "flac" | "aac" | "amr" | "awb" | "opus"
+                )
+            });
+            is_video |= has_duration && !is_audio_file;
             if let (Some(ref mut t), Some(ref ext)) = (&mut title, &file_ext) {
                 let suffix = format!(".{ext}");
                 if !t
@@ -6593,7 +6601,6 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
             "chat.video" | "video" | "18" | "chat.video.msg"
         ) || link_src.as_deref() == Some("Video Zalo")
             || raw_content_val.and_then(|v| v.get("videoUrl")).is_some()
-            || raw_content_val.and_then(|v| v.get("duration")).is_some()
             || link_url.as_deref().is_some_and(|u| {
                 let l = u.to_ascii_lowercase();
                 l.ends_with(".mp4")
