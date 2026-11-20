@@ -6517,7 +6517,9 @@ fn extract_link_info(
                 .as_deref()
                 .filter(|name| !name.starts_with("http://") && !name.starts_with("https://"))
                 .and_then(|name| name.rsplit_once('.'))
-                .filter(|(base, ext)| !base.is_empty() && !ext.is_empty())
+                .filter(|(base, ext)| {
+                    !base.is_empty() && !ext.is_empty() && !ext.chars().any(char::is_whitespace)
+                })
                 .map(|(_, ext)| ext);
             let has_file_extension = file_ext.is_some() || title_ext.is_some();
             is_video |= file_ext.as_deref().is_some_and(is_video_file_extension)
@@ -10966,6 +10968,25 @@ mod send_identity_tests {
         let msg = parse_chat_message(&raw_file).expect("must parse PDF message");
         assert_eq!(msg.kind, crate::message_model::MessageKind::File);
         assert_eq!(msg.link_src.as_deref(), Some("Tập tin Zalo"));
+    }
+
+    #[test]
+    fn parse_dotted_display_title_uses_duration_video_fallback() {
+        let raw_video = json!({
+            "msgId": "video_dotted_title",
+            "msgType": "chat.recommended",
+            "uidFrom": "1000002",
+            "ts": 1700000004700_i64,
+            "content": {
+                "title": "v1.2 notes",
+                "href": "https://media.example/download/opaque-token",
+                "params": "{\"duration\":\"45\"}"
+            }
+        });
+
+        let msg = parse_chat_message(&raw_video).expect("must parse duration-based video message");
+        assert_eq!(msg.kind, crate::message_model::MessageKind::Video);
+        assert_eq!(msg.link_src.as_deref(), Some("Video Zalo"));
     }
 
     #[test]
